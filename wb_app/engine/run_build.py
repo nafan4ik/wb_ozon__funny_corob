@@ -30,6 +30,14 @@ def norm_key(s: str) -> str:
 def norm_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("\xa0", " ")).strip()
 
+def is_wb_paired_article(article: str) -> bool:
+    """
+    Парный артикул WB, если содержит ПАРКР или ПАРН (без учёта регистра).
+    """
+    a = (article or "").upper()
+    return ("ПАРКР" in a) or ("ПАРН" in a)
+
+
 def compose_sheets(
     pool: list[tuple[str, str]],
     sheets_dir: str,
@@ -137,34 +145,72 @@ def build_wb_single_index(makets_dir: str) -> dict[str, str]:
 
     return idx
 
-
-def build_pool_from_index(
+def build_wb_pool_from_index(
     need: Counter,
     index: dict[str, str],
-    allow_contains: bool = True
+    allow_contains: bool = True,
 ) -> tuple[list[tuple[str, str]], list[str]]:
     """
-    Возвращает pool: [(article, path), ...] ровно нужное кол-во.
+    WB пул: [(article_for_name, path), ...]
+    Для парных артикулов ищем ART(1) и ART(2) и добавляем 2*qty элементов.
     """
     pool: list[tuple[str, str]] = []
     not_found: list[str] = []
 
     for article, qty in need.items():
-        key = norm_key(article)
-        path = index.get(key)
+        raw_article = str(article)
+        key = norm_key(raw_article)
 
-        if path is None and allow_contains:
-            for k, p in index.items():
-                if key in k:
-                    path = p
-                    break
+        if is_wb_paired_article(raw_article):
+            k1 = norm_key(raw_article + "(1)")
+            k2 = norm_key(raw_article + "(2)")
 
-        if path is None:
-            not_found.append(article)
-            continue
+            p1 = index.get(k1)
+            p2 = index.get(k2)
 
-        for _ in range(int(qty)):
-            pool.append((key, path))
+            # fallback по вхождению (на случай если в имени есть ещё что-то)
+            if allow_contains:
+                if p1 is None:
+                    for k, p in index.items():
+                        if k1 in k:
+                            p1 = p
+                            break
+                if p2 is None:
+                    for k, p in index.items():
+                        if k2 in k:
+                            p2 = p
+                            break
+
+            if p1 is None or p2 is None:
+                miss = []
+                if p1 is None:
+                    miss.append("(1)")
+                if p2 is None:
+                    miss.append("(2)")
+                not_found.append(f"{key} missing {','.join(miss)}")
+                continue
+
+            # на каждую "штуку" добавляем пару (1)+(2)
+            for _ in range(int(qty)):
+                pool.append((key, p1))
+                pool.append((key, p2))
+
+        else:
+            # обычный (не парный)
+            path = index.get(key)
+
+            if path is None and allow_contains:
+                for k, p in index.items():
+                    if key in k:
+                        path = p
+                        break
+
+            if path is None:
+                not_found.append(key)
+                continue
+
+            for _ in range(int(qty)):
+                pool.append((key, path))
 
     return pool, not_found
 
@@ -293,7 +339,7 @@ def run(
     wb_need = wb_needed_counter(wb_articles)
 
     wb_index = build_wb_single_index(wb_singles_dir)
-    wb_pool, wb_nf = build_pool_from_index(wb_need, wb_index, allow_contains=True)
+    wb_pool, wb_nf = build_wb_pool_from_index(wb_need, wb_index, allow_contains=True)
 
     compose_sheets(wb_pool, wb_sheets_dir, gap=gap)
     wb_sheets_count = (len(wb_pool) + 2) // 3
@@ -307,7 +353,7 @@ def run(
 
     oz_need = ozon_need_from_df(oz_df)
     oz_index = build_ozon_single_index(ozon_singles_dir)
-    oz_pool, oz_nf = build_pool_from_index(oz_need, oz_index, allow_contains=True)
+    oz_pool, oz_nf = build_wb_pool_from_index(oz_need, oz_index, allow_contains=True)
 
     compose_sheets(oz_pool, ozon_sheets_dir, gap=gap)
     oz_sheets_count = (len(oz_pool) + 2) // 3

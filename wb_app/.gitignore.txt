@@ -1,1 +1,7 @@
+# user data / runtime
+postavka-*/
+*.log
 
+# OS
+.DS_Store
+Thumbs.db
