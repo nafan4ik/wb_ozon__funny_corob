@@ -2,6 +2,8 @@ import os
 import re
 from collections import Counter
 from datetime import datetime
+from datetime import datetime, timedelta
+import shutil
 
 import pdfplumber
 from PIL import Image
@@ -30,12 +32,13 @@ def norm_key(s: str) -> str:
 def norm_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("\xa0", " ")).strip()
 
-def is_wb_paired_article(article: str) -> bool:
+def is_paired_marker(s: str) -> bool:
     """
-    Парный артикул WB, если содержит ПАРКР или ПАРН (без учёта регистра).
+    Парность по маркерам в тексте: ПАРКР или ПАРН (без учёта регистра).
     """
-    a = (article or "").upper()
-    return ("ПАРКР" in a) or ("ПАРН" in a)
+    x = (s or "").upper()
+    return ("ПАРКР" in x) or ("ПАРН" in x)
+
 
 
 def compose_sheets(
@@ -83,6 +86,50 @@ def compose_sheets(
         out_path = make_unique_sheet_path(sheets_dir, base_name, ext=".jpg")
         sheet.save(out_path)
 
+def cleanup_old_postavki(base_dir: str = r"C:\korob", keep_days: int = 2):
+    """
+    Удаляет папки вида postavka-YYYY-MM-DD_HH-MM-SS, если они старше keep_days.
+    Если имя не парсится — fallback по mtime.
+    """
+    prefix = "postavka-"
+    now = datetime.now()
+    deadline = now - timedelta(days=keep_days)
+
+    if not os.path.isdir(base_dir):
+        return 0
+
+    removed = 0
+    for name in os.listdir(base_dir):
+        if not name.startswith(prefix):
+            continue
+
+        full = os.path.join(base_dir, name)
+        if not os.path.isdir(full):
+            continue
+
+        # пробуем распарсить дату из имени
+        dt = None
+        ts = name[len(prefix):]
+        try:
+            dt = datetime.strptime(ts, "%Y-%m-%d_%H-%M-%S")
+        except Exception:
+            dt = None
+
+        # fallback: по времени изменения папки
+        if dt is None:
+            try:
+                dt = datetime.fromtimestamp(os.path.getmtime(full))
+            except Exception:
+                continue
+
+        if dt < deadline:
+            try:
+                shutil.rmtree(full, ignore_errors=True)
+                removed += 1
+            except Exception:
+                pass
+
+    return removed
 
 
 def cleanup_postavka_leave_images_only(dest_dir: str) -> int:
@@ -145,6 +192,83 @@ def build_wb_single_index(makets_dir: str) -> dict[str, str]:
 
     return idx
 
+def build_pool_from_index_with_pairs(
+    need: Counter,
+    index: dict[str, str],
+    allow_contains: bool = True,
+    pair_by_marker: bool = True,
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """
+    Универсальный пул:
+    - если есть пара ART(1) и ART(2) в индексе -> добавляем 2*qty
+    - иначе обычный ART -> qty
+
+    pair_by_marker=True: сначала пробуем маркер ПАРКР/ПАРН (в article),
+    но для OZON можно оставить True — не мешает.
+    """
+    pool: list[tuple[str, str]] = []
+    not_found: list[str] = []
+
+    for article, qty in need.items():
+        raw_article = str(article)
+        key = norm_key(raw_article)
+
+        # 1) Сначала проверим "парность": либо по маркеру, либо по факту существования (1)/(2)
+        k1 = norm_key(raw_article + "(1)")
+        k2 = norm_key(raw_article + "(2)")
+
+        p1 = index.get(k1)
+        p2 = index.get(k2)
+
+        if allow_contains:
+            if p1 is None:
+                for k, p in index.items():
+                    if k1 in k:
+                        p1 = p
+                        break
+            if p2 is None:
+                for k, p in index.items():
+                    if k2 in k:
+                        p2 = p
+                        break
+
+        has_pair_files = (p1 is not None and p2 is not None)
+        has_pair_marker = is_paired_marker(raw_article) if pair_by_marker else False
+
+        if has_pair_files or has_pair_marker:
+            # если маркер есть, но файлов пары нет — считаем ошибкой
+            if not has_pair_files:
+                miss = []
+                if p1 is None:
+                    miss.append("(1)")
+                if p2 is None:
+                    miss.append("(2)")
+                not_found.append(f"{key} missing {','.join(miss)}")
+                continue
+
+            for _ in range(int(qty)):
+                pool.append((key, p1))
+                pool.append((key, p2))
+            continue
+
+        # 2) обычный режим
+        path = index.get(key)
+        if path is None and allow_contains:
+            for k, p in index.items():
+                if key in k:
+                    path = p
+                    break
+
+        if path is None:
+            not_found.append(key)
+            continue
+
+        for _ in range(int(qty)):
+            pool.append((key, path))
+
+    return pool, not_found
+
+
 def build_wb_pool_from_index(
     need: Counter,
     index: dict[str, str],
@@ -161,7 +285,7 @@ def build_wb_pool_from_index(
         raw_article = str(article)
         key = norm_key(raw_article)
 
-        if is_wb_paired_article(raw_article):
+        if is_paired_marker(raw_article):
             k1 = norm_key(raw_article + "(1)")
             k2 = norm_key(raw_article + "(2)")
 
@@ -222,7 +346,7 @@ def ozon_pdf_to_df(pdf_path: str):
 
     row_ship_re = re.compile(r"^\s*(\d+)\s+(\d{6,}-\d{4}-\d)\b")
     ship_re = re.compile(r"\b\d{6,}-\d{4}-\d\b")
-    art_qty_re = re.compile(r"\b(\d{9})\b\s+(\d{1,3})\b")
+    art_qty_re = re.compile(r"\b(\d{8,9})\b\s+(\d{1,3})\b")
 
     rows = []
     current_shipment = None
@@ -285,33 +409,120 @@ def ozon_need_from_df(df) -> Counter:
 
 def build_ozon_single_index(makets_dir: str) -> dict[str, str]:
     """
-    OZON одиночные: вытаскиваем 9-значный артикул из имени файла.
-    Если в названии несколько 9-значных — берём первый.
+    OZON одиночные:
+    - вытаскиваем артикул 8-9 цифр
+    - если в имени есть (1) или (2) -> ключ ART(1)/ART(2)
+    - иначе ключ ART
     """
     IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
     idx: dict[str, str] = {}
+
+    art_re = re.compile(r"\b(\d{8,9})\b")
+    pair_re = re.compile(r"\((\s*[12]\s*)\)")
 
     for f in os.listdir(makets_dir):
         p = os.path.join(makets_dir, f)
         if not os.path.isfile(p):
             continue
+
         name, ext = os.path.splitext(f)
         if ext.lower() not in IMAGE_EXTS:
             continue
 
-        found = re.findall(r"\b\d{9}\b", name)
-        if not found:
+        m_art = art_re.search(name)
+        if not m_art:
             continue
 
-        art = norm_key(found[0])
-        # если несколько файлов на один артикул — оставим первый (можно поменять логику)
-        idx.setdefault(art, p)
+        art = m_art.group(1)
+        m_pair = pair_re.search(name)
+
+        if m_pair:
+            n = m_pair.group(1).strip()  # 1 или 2
+            key = norm_key(f"{art}({n})")
+        else:
+            key = norm_key(art)
+
+        idx[key] = p
 
     return idx
 
 
+def ozon_pair_exists_in_index(article: str, index: dict[str, str]) -> tuple[bool, bool]:
+    """
+    Возвращает (has_1, has_2) для ART(1)/ART(2) в индексе.
+    """
+    k1 = norm_key(str(article) + "(1)")
+    k2 = norm_key(str(article) + "(2)")
+    return (k1 in index), (k2 in index)
+def build_ozon_pool_from_index(
+    need: Counter,
+    index: dict[str, str],
+    allow_contains: bool = True,
+) -> tuple[list[tuple[str, str]], list[str]]:
+    pool: list[tuple[str, str]] = []
+    not_found: list[str] = []
+
+    for article, qty in need.items():
+        raw = str(article)
+        key = norm_key(raw)
+
+        k1 = norm_key(raw + "(1)")
+        k2 = norm_key(raw + "(2)")
+
+        p1 = index.get(k1)
+        p2 = index.get(k2)
+
+        if allow_contains:
+            if p1 is None:
+                for k, p in index.items():
+                    if k1 in k:
+                        p1 = p
+                        break
+            if p2 is None:
+                for k, p in index.items():
+                    if k2 in k:
+                        p2 = p
+                        break
+
+        # Считаем парным, если в папке есть хотя бы один из (1)/(2)
+        if p1 is not None or p2 is not None:
+            miss = []
+            if p1 is None:
+                miss.append("(1)")
+            if p2 is None:
+                miss.append("(2)")
+
+            if miss:
+                not_found.append(f"{key} missing {','.join(miss)}")
+                continue
+
+            for _ in range(int(qty)):
+                pool.append((key, p1))
+                pool.append((key, p2))
+            continue
+
+        # обычный
+        path = index.get(key)
+        if path is None and allow_contains:
+            for k, p in index.items():
+                if key in k:
+                    path = p
+                    break
+
+        if path is None:
+            not_found.append(key)
+            continue
+
+        for _ in range(int(qty)):
+            pool.append((key, path))
+
+    return pool, not_found
+
+
+
 # ======================= RUN =======================
 def run(
+
     wb_pdf: str,
     wb_singles_dir: str,
     ozon_pdf: str,
@@ -324,9 +535,12 @@ def run(
     Главная функция для UI.
     WB и OZON оба работают через папки одиночных макетов и оба собирают листы по 3.
     """
+    # перед созданием новой поставки чистим старые
+    cleanup_old_postavki(r"C:\korob", keep_days=2)
     now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     dest_dir = rf"C:\korob\postavka-{now}"
     os.makedirs(dest_dir, exist_ok=True)
+
 
     wb_sheets_dir = os.path.join(dest_dir, "wb")
     ozon_sheets_dir = os.path.join(dest_dir, "ozon")
@@ -339,7 +553,7 @@ def run(
     wb_need = wb_needed_counter(wb_articles)
 
     wb_index = build_wb_single_index(wb_singles_dir)
-    wb_pool, wb_nf = build_wb_pool_from_index(wb_need, wb_index, allow_contains=True)
+    wb_pool, wb_nf = build_pool_from_index_with_pairs(wb_need, wb_index, allow_contains=True, pair_by_marker=True)
 
     compose_sheets(wb_pool, wb_sheets_dir, gap=gap)
     wb_sheets_count = (len(wb_pool) + 2) // 3
@@ -353,7 +567,12 @@ def run(
 
     oz_need = ozon_need_from_df(oz_df)
     oz_index = build_ozon_single_index(ozon_singles_dir)
-    oz_pool, oz_nf = build_wb_pool_from_index(oz_need, oz_index, allow_contains=True)
+    sample = [k for k in oz_index.keys() if "(1)" in k or "(2)" in k][:20]
+    print("OZON pair keys sample:", sample)
+    print("OZON index size:", len(oz_index))
+
+    oz_pool, oz_nf = build_ozon_pool_from_index(oz_need, oz_index, allow_contains=True)
+
 
     compose_sheets(oz_pool, ozon_sheets_dir, gap=gap)
     oz_sheets_count = (len(oz_pool) + 2) // 3

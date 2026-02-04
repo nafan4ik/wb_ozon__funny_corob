@@ -42,7 +42,7 @@ def pick_default_pdfs_from_downloads(
         return default_wb, default_ozon
 
     # берём только файлы (можно ограничить PDF, но ты не просил — если надо, добавим фильтр)
-    files = [p for p in downloads.iterdir() if p.is_file()]
+    files = [p for p in downloads.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"]
     if not files:
         return default_wb, default_ozon
 
@@ -173,6 +173,7 @@ class MainWindow(QWidget):
     def on_run(self):
         self.btn_run.setEnabled(False)
         self.log.append("Запуск...\n")
+
 
         try:
             result = run(

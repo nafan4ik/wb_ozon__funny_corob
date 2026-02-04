@@ -799,6 +799,7 @@
   ('glob',
    'C:\\Users\\YolaA\\AppData\\Local\\Programs\\Python\\Python314\\Lib\\glob.py',
    'PYMODULE'),
+  ('goblin_dialog', 'C:\\korob\\wb_app\\goblin_dialog.py', 'PYMODULE'),
   ('gzip',
    'C:\\Users\\YolaA\\AppData\\Local\\Programs\\Python\\Python314\\Lib\\gzip.py',
    'PYMODULE'),
